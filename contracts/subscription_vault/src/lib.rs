@@ -59,6 +59,8 @@ mod test_billing_period_snapshots;
 mod test_governance;
 #[cfg(test)]
 mod test_merchant_query_ordering;
+#[cfg(test)]
+mod test_subscription_transfer;
 mod types;
 mod validation;
 
@@ -695,7 +697,8 @@ pub use state_machine::{can_transition, get_allowed_transitions, validate_status
 pub use types::{
     AcceptedToken, AccruedTotals, AdminProposal, AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent,
-    BatchChargeResult, BatchSizeWarningEvent, BatchWithdrawResult, BillingChargeKind,
+    BatchChargeResponse, BatchChargeResult, BatchSizeWarningEvent, BatchWithdrawResult,
+    BillingChargeKind,
     BillingCompactedEvent, BillingCompactionSummary,
     BillingPeriodSnapshot, BillingRetentionConfig, BillingStatement, BillingStatementAggregate,
     BillingStatementsPage, BulkSubscriptionResult, CapInfo, ChargeExecutionResult,
@@ -1055,7 +1058,9 @@ impl SubscriptionVault {
     /// the same batch fails, the earlier successful charges are *not* rolled
     /// back. The returned `Vec<BatchChargeResult>` is in request order and
     /// reports, per id, whether it succeeded and (on failure) the error code,
-    /// so callers can determine exactly which ids were actually charged.
+    /// so callers can determine exactly which ids were actually charged. The
+    /// nonce is consumed only if at least one result has `success = true`; a
+    /// batch where every item fails leaves the nonce available for retry.
     ///
     /// # Per-subscription idempotency keys
     ///
@@ -1091,7 +1096,8 @@ impl SubscriptionVault {
     /// per-transaction instruction budget is a network limit: without a
     /// contract-level cap an oversized batch would abort with a generic
     /// execution error that a caller cannot distinguish from out-of-gas.
-    /// Split the batch and retry with a fresh nonce. See `docs/batch_charge.md`.
+    /// Split oversized batches and retry with the same nonce; batches with at
+    /// least one successful result consume it. See `docs/batch_charge.md`.
     /// Accepted batches above [`BATCH_RECOMMENDED_SIZE`] (50) emit a
     /// `batch_size_warning` event; they are still processed normally.
     ///
@@ -1114,8 +1120,26 @@ impl SubscriptionVault {
         idem_keys: Option<Vec<soroban_sdk::BytesN<32>>>,
         nonce: u64,
     ) -> Result<Vec<BatchChargeResult>, Error> {
+        let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "batch_charge")?;
         require_not_emergency_stop(&env)?;
         admin::do_batch_charge(&env, &subscription_ids, idem_keys.as_ref(), nonce)
+    }
+
+    /// Charge a batch while returning the duplicate ID for duplicate validation failures.
+    ///
+    /// Unlike [`batch_charge`](Self::batch_charge), a duplicate-ID batch returns
+    /// `Ok` with an empty `results` vector and the repeated ID in `duplicate_id`.
+    /// The batch is rejected before any state change or nonce consumption. Other
+    /// argument validation and operation failures retain their existing errors.
+    pub fn batch_charge_detailed(
+        env: Env,
+        subscription_ids: Vec<u32>,
+        idem_keys: Option<Vec<soroban_sdk::BytesN<32>>>,
+        nonce: u64,
+    ) -> Result<BatchChargeResponse, Error> {
+        let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "batch_charge")?;
+        require_not_emergency_stop(&env)?;
+        admin::do_batch_charge_detailed(&env, &subscription_ids, idem_keys.as_ref(), nonce)
     }
 
     // ── Bulk pause / cancel (operational hygiene) ─────────────────────────────

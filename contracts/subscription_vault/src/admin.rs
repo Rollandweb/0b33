@@ -562,11 +562,11 @@ pub(crate) fn read_cached_admin_config(env: &Env) -> Result<CachedAdminConfig, E
     })
 }
 
-/// Execute the core batch-charge loop without any auth or nonce checks.
+/// Execute the core batch-charge loop without auth or nonce advancement.
 ///
 /// Called by both `do_batch_charge` (admin path) and
-/// `operator::do_operator_batch_charge` (operator path) after their respective
-/// auth/nonce guards have been satisfied.
+/// `operator::do_operator_batch_charge` (operator path) after authorization and
+/// nonce validation have been satisfied.
 pub(crate) fn execute_batch_charge(
     env: &Env,
     subscription_ids: &Vec<u32>,
@@ -595,27 +595,33 @@ pub(crate) fn execute_batch_charge(
         let r = charge_one(env, id, now, idem_key, admin_ref, Some(&mut merchant_cache));
         let res = match r {
             Ok(ChargeExecutionResult::Charged) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             Ok(ChargeExecutionResult::InsufficientBalance) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: Error::InsufficientBalance.to_code(),
             },
             Ok(ChargeExecutionResult::LifetimeCapReached) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: Error::LifetimeCapReached.to_code(),
             },
             Ok(ChargeExecutionResult::ScheduledCancellation) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             // auto_renew=false and interval elapsed: silently skip without error.
             Ok(ChargeExecutionResult::Skipped) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             Err(e) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: e.to_code(),
             },
@@ -629,9 +635,9 @@ pub(crate) fn execute_batch_charge(
 ///
 /// # Input validation
 ///
-/// Both argument-shape checks run *before* the nonce is consumed, so a
-/// malformed batch is a total no-op: no state is mutated and the caller's
-/// nonce is still valid for a corrected retry.
+/// Input validation runs before charge processing. The nonce is validated
+/// before processing, then consumed only if at least one result succeeds.
+/// An all-failure batch leaves the nonce available for a corrected retry.
 ///
 /// 1. **Batch length** — at most [`BATCH_MAX_SIZE`] ids. Larger batches are
 ///    rejected with [`Error::InvalidInput`]. This is a contract-level guard,
@@ -651,6 +657,19 @@ pub fn do_batch_charge(
     idem_keys: Option<&Vec<soroban_sdk::BytesN<32>>>,
     nonce: u64,
 ) -> Result<Vec<BatchChargeResult>, Error> {
+    let response = do_batch_charge_detailed(env, subscription_ids, idem_keys, nonce)?;
+    if response.duplicate_id.is_some() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(response.results)
+}
+
+pub fn do_batch_charge_detailed(
+    env: &Env,
+    subscription_ids: &Vec<u32>,
+    idem_keys: Option<&Vec<soroban_sdk::BytesN<32>>>,
+    nonce: u64,
+) -> Result<crate::types::BatchChargeResponse, Error> {
     let admin = require_stored_admin_auth(env)?;
 
     // Validate batch size before processing. Reported as InvalidInput so the
@@ -663,7 +682,10 @@ pub fn do_batch_charge(
 
     // Empty batch is allowed as a no-op
     if subscription_ids.len() == 0 {
-        return Ok(Vec::new(env));
+        return Ok(crate::types::BatchChargeResponse {
+            results: Vec::new(env),
+            duplicate_id: None,
+        });
     }
 
     // When idem_keys are supplied their count must match subscription_ids exactly
@@ -678,25 +700,35 @@ pub fn do_batch_charge(
     let mut seen_ids = soroban_sdk::Vec::<u32>::new(env);
     for id in subscription_ids.iter() {
         if seen_ids.contains(&id) {
-            return Err(Error::InvalidInput); // Clear error for duplicate IDs
+            return Ok(crate::types::BatchChargeResponse {
+                results: Vec::new(env),
+                duplicate_id: Some(id),
+            });
         }
         seen_ids.push_back(id);
     }
 
-    // Nonce check must run after input validation but before any state mutation to prevent replay.
-    // Domain DOMAIN_BATCH_CHARGE separates this counter from other admin ops.
+    // Validate the nonce before processing, then consume it only if at least
+    // one per-item result succeeds. The entrypoint's reentrancy lock protects
+    // this deferred advance while charges perform external token calls.
+    crate::nonce::validate_nonce(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)?;
     let batch_nonce_key = Symbol::new(env, BATCH_NONCE_CONTEXT);
     env.storage().instance().set(&batch_nonce_key, &nonce);
-    if let Err(error) =
-        crate::nonce::check_and_advance(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)
-    {
-        env.storage().instance().remove(&batch_nonce_key);
-        return Err(error);
-    }
 
     let results = execute_batch_charge(env, subscription_ids, idem_keys);
+    if results.iter().any(|result| result.success) {
+        if let Err(error) =
+            crate::nonce::check_and_advance(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)
+        {
+            env.storage().instance().remove(&batch_nonce_key);
+            return Err(error);
+        }
+    }
     env.storage().instance().remove(&batch_nonce_key);
-    Ok(results)
+    Ok(crate::types::BatchChargeResponse {
+        results,
+        duplicate_id: None,
+    })
 }
 
 /// Performs a single interval-based charge. Admin only.

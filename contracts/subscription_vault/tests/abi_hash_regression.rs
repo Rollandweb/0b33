@@ -264,6 +264,7 @@ mod abi_hash_regression {
             "cancel_admin_proposal",
             "set_operator",
             "batch_charge",
+            "batch_charge_detailed",
             "enable_emergency_stop",
             "disable_emergency_stop",
             "set_protocol_fee",

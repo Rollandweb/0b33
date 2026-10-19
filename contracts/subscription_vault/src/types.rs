@@ -1597,8 +1597,19 @@ pub struct NonceConsumedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BatchChargeResult {
+    pub subscription_id: u32,
     pub success: bool,
     pub error_code: u32,
+}
+
+/// Outcome of a detailed batch charge request.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchChargeResponse {
+    /// Per-subscription outcomes, empty when the batch is rejected for a duplicate ID.
+    pub results: Vec<BatchChargeResult>,
+    /// The repeated subscription ID when duplicate validation rejects the batch.
+    pub duplicate_id: Option<u32>,
 }
 
 #[contracttype]
