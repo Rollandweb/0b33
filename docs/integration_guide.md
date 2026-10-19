@@ -142,9 +142,10 @@ withdrawals, pause/resume/cancel, and export calls are **not** blocked.
 | `charge_usage_with_reference` | `(subscription_id, usage_amount, reference) -> ()` | Admin | Same as above with explicit replay-protection reference string. |
 | `charge_one_off` | `(subscription_id, merchant, amount) -> ()` | Merchant | Merchant-initiated ad-hoc debit. Blocked by emergency stop. |
 
-`BatchChargeResult` fields: `{ success: bool, error_code: u32 }`. When
-`success` is `false`, `error_code` identifies why that item failed (see [Error
-Codes](#error-codes-failure-modes--retry-behavior)).
+`BatchChargeResult` fields: `{ subscription_id: u32, success: bool,
+error_code: u32 }`. `subscription_id` identifies the input item for this
+result independently of vector position. When `success` is `false`,
+`error_code` identifies why that item failed (see [Error Codes](#error-codes-failure-modes--retry-behavior)).
 
 ### Merchant
 
@@ -299,7 +300,7 @@ Pre-conditions:
 
 ```
 Admin: batch_charge([sub_id])
-  → BatchChargeResult { success: false, error_code: 5001 }
+  → BatchChargeResult { subscription_id: sub_id, success: false, error_code: 5001 }
   → contract emits SubscriptionChargeFailedEvent
   → status transitions to GracePeriod or InsufficientBalance
 
@@ -635,7 +636,7 @@ function run_billing_batch(ids, nonce):
     if failed is empty:
         return
 
-    # ── Classify each failure. A FRESH nonce is required for the retry. ──
+    # ── Classify failures; nonce depends on whether any item succeeded. ──
     retryable   = []
     wait_for_event = []
     drop = []
@@ -650,8 +651,8 @@ function run_billing_batch(ids, nonce):
             default:                  drop.append(id)        # structural; investigate
 
     if retryable is not empty:
-        # NOTE: fresh nonce — the previous batch consumed its own.
-        run_billing_batch(retryable, fresh_nonce())
+        next_nonce = nonce if succeeded is empty else nonce + 1
+        run_billing_batch(retryable, next_nonce)
 
     for id in wait_for_event:
         # Re-queue on the event, not on a timer. Do not tight-loop: a short
@@ -662,8 +663,9 @@ function run_billing_batch(ids, nonce):
 
 ##### Rules of thumb
 
-1. **Fresh nonce per executed batch.** A nonce is consumed the moment a batch
-   runs, whether or not any item succeeded. Reusing it yields `Replay` (4005).
+1. **Nonce follows successful batch outcomes.** A batch consumes its nonce if
+  at least one item returns `success = true`; an all-failure batch leaves it
+  available for retry. After partial or full success, fetch the next nonce.
 2. **Idempotency comes from the contract, not from your queue.** The
    `period_index` / `last_payment_timestamp` guard means a duplicate attempt
    can never double-charge. Design your retry so it is *cheap and quiet*, not so

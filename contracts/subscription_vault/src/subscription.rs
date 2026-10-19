@@ -3981,6 +3981,30 @@ pub fn do_accept_transfer(
     let additional_liability = safe_add(sub.prepaid_balance, liability_amount)?;
     enforce_credit_limit_for_delta(env, &to, &sub.token, additional_liability)?;
 
+    let counts_toward_active_cap = matches!(
+        sub.status,
+        SubscriptionStatus::Active
+            | SubscriptionStatus::GracePeriod
+            | SubscriptionStatus::InsufficientBalance
+    );
+    if counts_toward_active_cap {
+        let active_count = get_subscriber_active_count(env, &to);
+        let active_cap = get_subscriber_active_cap(env, &to);
+        if active_count >= active_cap {
+            env.events().publish(
+                (Symbol::new(env, "subscriber_cap_reached"), to.clone()),
+                crate::types::SubscriberCapReachedEvent {
+                    subscriber: to.clone(),
+                    active_count,
+                    cap: active_cap,
+                    timestamp: env.ledger().timestamp(),
+                    schema_version: crate::types::EVENT_SCHEMA_VERSION,
+                },
+            );
+            return Err(Error::MaxConcurrentSubscriptionsReached);
+        }
+    }
+
     // Remove from old subscriber's index
     let old_subscriber_key = DataKey::SubscriberSubs(sub.subscriber.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&old_subscriber_key) {
@@ -4001,6 +4025,10 @@ pub fn do_accept_transfer(
     new_ids.push_back(subscription_id);
     env.storage().instance().set(&new_subscriber_key, &new_ids);
 
+    if counts_toward_active_cap {
+        decrement_subscriber_active_count(env, &sub.subscriber);
+        increment_subscriber_active_count(env, &to);
+    }
     sub.subscriber = to.clone();
     write_subscription(env, subscription_id, &sub);
 

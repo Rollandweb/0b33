@@ -13,6 +13,12 @@ pub fn batch_charge(
 ) -> Result<Vec<BatchChargeResult>, Error>
 ```
 
+Call `batch_charge_detailed` when operators need the offending ID in the
+response. It returns `BatchChargeResponse`, whose `duplicate_id` is `Some(id)`
+and whose `results` is empty when a duplicate rejects the batch. The original
+`batch_charge` remains available and continues to return `Error::InvalidInput`
+for duplicate IDs.
+
 ## Maximum batch size
 
 **`BATCH_MAX_SIZE` = 100 ids per call.** The bound is a compile-time constant
@@ -23,9 +29,13 @@ before any id is processed.
 | `subscription_ids.len()` | Behaviour |
 |--------------------------|-----------|
 | `0` | No-op. Returns an empty vector; the nonce is **not** consumed. |
-| `1 ..= 50` | Processed normally (subject to the duplicate-id rule below). |
-| `51 ..= 100` | Processed normally (subject to duplicate-id validation) and emits a `batch_size_warning` event. |
+| `1 ..= 50` | Processed normally if all IDs are unique. |
+| `51 ..= 100` | Processed normally if all IDs are unique and emits a `batch_size_warning` event. |
 | `> 100` | Rejected wholesale with `Error::InvalidInput` (code `3002`). No id is charged, no result vector is returned, and the nonce is **not** consumed. |
+
+Duplicate IDs are rejected wholesale before the nonce is consumed. The
+`batch_charge` entrypoint returns `Error::InvalidInput`; the detailed entrypoint
+returns the duplicate ID in `BatchChargeResponse.duplicate_id`.
 
 The warning event payload includes `batch_size`, `recommended_max_size` (50),
 `schema_version`, and `contract_id`. It is emitted only for a valid batch that
@@ -53,8 +63,8 @@ split the batch and retry with the same nonce.
   — a cold subscription read is more expensive than a warm one — so a batch
   near the ceiling is more likely to approach the network instruction budget.
 - **Batching pattern:** chunk a larger billing run into ceil(N / 50) calls of
-  at most 50 ids each. Because each call consumes its own nonce, use a
-  distinct nonce per chunk.
+  at most 50 ids each. Supply the current nonce for each chunk; it advances
+  only when that chunk has at least one successful result.
 - Treat 100 as a rejection threshold to stay away from, not a target.
 
 ### Oversized-batch retry
@@ -145,11 +155,11 @@ this parameter was introduced: no per-ID replay protection beyond the batch nonc
 
 ## Partial-success model
 
-Admin authentication and the batch nonce check happen once at the batch
-boundary. After those checks pass, each ID is processed independently through
-the shared `charge_one` path. An item failure does not roll back successful
-items or abort the remaining items. The call returns exactly one result for
-each input ID, including IDs that are missing or repeated.
+Admin authentication and batch nonce validation happen once at the batch
+boundary. Each ID is then processed independently through the shared
+`charge_one` path. An item failure does not roll back successful items or abort
+the remaining items. For a valid (duplicate-free) batch, the call returns
+exactly one result for each input ID, including IDs that are missing.
 
 ## `BatchChargeResult`
 
@@ -157,6 +167,7 @@ The result vector has the same order and length as `subscription_ids`:
 
 | Field | Type | Values |
 |-------|------|--------|
+| `subscription_id` | `u32` | The input subscription ID this result describes |
 | `success` | `bool` | `true` when that item completed without an item-level error |
 | `error_code` | `u32` | `0` on success; otherwise the corresponding `Error` code |
 
@@ -167,10 +178,10 @@ semantics, including any per-item lifecycle transition such as entering
 
 ## Ordering guarantees
 
-Results are appended while iterating `subscription_ids`, so result `i`
-corresponds to input ID `i`. Processing is sequential. This means duplicate
-IDs are processed at each position, and a later duplicate observes state
-written by the earlier occurrence in the same batch.
+Results are appended while iterating `subscription_ids`, and each result also
+contains its `subscription_id`, so callers can associate outcomes without
+relying only on vector position. Duplicate IDs reject the entire batch before
+processing begins; use `batch_charge_detailed` to identify the repeated ID.
 
 ## Skip conditions
 - Subscription not found
@@ -180,9 +191,13 @@ written by the earlier occurrence in the same batch.
 
 ## Retry guidance
 
-The batch nonce is consumed before item processing. A retry of the same batch
-must therefore use a fresh nonce; reusing the old nonce is rejected as a
-replay. Prefer retrying only the failed IDs after correcting their cause:
+The batch nonce is consumed only when at least one result has `success = true`.
+If every result is an individual failure, the nonce remains available, so a
+corrected retry may reuse it. Item-level failures can still emit diagnostics
+or apply lifecycle transitions (for example, marking an expired subscription
+as expired); nonce reuse does not roll back those per-item effects. A batch
+with any successful result consumes its nonce, and a retry must use a fresh
+one. Prefer retrying only failed IDs after correcting their cause:
 top up and explicitly resume an underfunded subscription, wait for an interval
 that has not elapsed, or remove/replace an ID that no longer exists. Do not
 blindly retry successful IDs, because their next result may be
