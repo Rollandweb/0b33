@@ -1927,21 +1927,26 @@ fn test_batch_charge() {
     assert_eq!(results.len(), 5);
 
     // id1: Success
+    assert_eq!(results.get(0).unwrap().subscription_id, id1);
     assert!(results.get(0).unwrap().success);
 
     // 999: NotFound (404)
+    assert_eq!(results.get(1).unwrap().subscription_id, 999);
     assert!(!results.get(1).unwrap().success);
     assert_eq!(results.get(1).unwrap().error_code, Error::NotFound as u32);
 
     // id2: InsufficientBalance (1003)
+    assert_eq!(results.get(2).unwrap().subscription_id, id2);
     assert!(!results.get(2).unwrap().success);
     assert_eq!(results.get(2).unwrap().error_code, Error::InsufficientBalance as u32);
 
     // id3: NotActive (1002)
+    assert_eq!(results.get(3).unwrap().subscription_id, id3);
     assert!(!results.get(3).unwrap().success);
     assert_eq!(results.get(3).unwrap().error_code, Error::NotActive as u32);
 
     // id4: IntervalNotElapsed (1001)
+    assert_eq!(results.get(4).unwrap().subscription_id, id4);
     assert!(!results.get(4).unwrap().success);
     assert_eq!(results.get(4).unwrap().error_code, Error::IntervalNotElapsed as u32);
 }
@@ -1952,17 +1957,52 @@ fn test_batch_charge_duplicate_ids() {
     env.ledger().set_timestamp(T0);
     let (id, _, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
     seed_balance(&env, &client, id, PREPAID * 2);
+    let initial_nonce = client.get_admin_nonce();
 
     env.ledger().set_timestamp(T0 + INTERVAL + 1);
     let ids = Vec::from_array(&env, [id, id]);
-    
+
+    let detailed = client.batch_charge_detailed(&ids, &None, &initial_nonce);
+    assert_eq!(detailed.duplicate_id, Some(id));
+    assert!(detailed.results.is_empty());
+    assert_eq!(client.get_admin_nonce(), initial_nonce);
+
     // With the fix, duplicate IDs should be rejected upfront with InvalidInput
-    let result = client.try_batch_charge(&ids, &0u64);
+    let result = client.try_batch_charge(&ids, &initial_nonce);
     assert_eq!(result, Err(Ok(Error::InvalidInput)));
 
     // Verify no charge occurred since the batch was rejected
     let sub = client.get_subscription(&id);
     assert_eq!(sub.prepaid_balance, PREPAID * 2); // No charge should have happened
+}
+
+#[test]
+fn test_batch_charge_all_item_failures_leave_nonce_available() {
+    let (env, client, _, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    let (paused_id, paused_subscriber, _) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    seed_balance(&env, &client, paused_id, PREPAID);
+    client.pause_subscription(&paused_id, &paused_subscriber);
+
+    let (chargeable_id, _, _) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    seed_balance(&env, &client, chargeable_id, PREPAID);
+
+    env.ledger().set_timestamp(T0 + INTERVAL + 1);
+    let nonce = client.get_admin_nonce(&admin, &0u32);
+    let failed_ids = Vec::from_array(&env, [paused_id]);
+    let failed_results = client.batch_charge(&failed_ids, &None, &nonce);
+
+    assert!(!failed_results.get(0).unwrap().success);
+    assert_eq!(client.get_admin_nonce(&admin, &0u32), nonce);
+
+    let retry_ids = Vec::from_array(&env, [chargeable_id, paused_id]);
+    let retry_results = client.batch_charge(&retry_ids, &None, &nonce);
+    assert!(retry_results.get(0).unwrap().success);
+    assert!(!retry_results.get(1).unwrap().success);
+    assert_eq!(client.get_admin_nonce(&admin, &0u32), nonce + 1);
 }
 
 #[test]

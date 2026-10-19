@@ -137,6 +137,18 @@ pub fn get_nonce(env: &Env, signer: &Address, domain: NonceDomain) -> u64 {
         .unwrap_or(0)
 }
 
+/// Validate the expected nonce without consuming it.
+pub fn validate_nonce(
+    env: &Env,
+    signer: &Address,
+    domain: NonceDomain,
+    expected: u64,
+) -> Result<(), Error> {
+    let key = DataKey::AdminNonce(signer.clone(), domain.as_u32());
+    let stored = env.storage().persistent().get::<DataKey, u64>(&key).unwrap_or(0);
+    compute_next_nonce(stored, expected).map(|_| ())
+}
+
 /// Consume a nonce, verifying it matches the current expected value and incrementing for the next call.
 ///
 /// This function implements the core replay-protection logic:
